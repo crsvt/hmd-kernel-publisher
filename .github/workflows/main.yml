@@ -1,0 +1,78 @@
+name: Pull and Push HMD Kernel Repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_name:
+        description: 'Device name to Pull (e.g., "Nokia 3"). Leave empty to run for all devices.'
+        required: false 
+        type: string
+  schedule:
+    - cron: '0 3 * * 0'
+
+jobs:
+  # Job 1: Get the list of all devices for a scheduled run or a full manual run
+  get-devices:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.device_name == '')
+    runs-on: ubuntu-latest
+    outputs:
+      devices: ${{ steps.set-matrix.outputs.devices }}
+    steps:
+      - id: set-matrix
+        run: |
+          JSON_URL="https://raw.githubusercontent.com/crsvt/hmd-oss-scraper/main/data/hmd_releases.json"
+          DEVICE_LIST=$(curl -sL "$JSON_URL" | jq -c 'keys')
+          echo "devices=$DEVICE_LIST" >> $GITHUB_OUTPUT
+
+  # Job 2A: (MANUAL TRIGGER W/ DEVICE NAME) Build a single device
+  build-for-manual-trigger:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.device_name != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Run for device - ${{ github.event.inputs.device_name }}
+        run: |
+          chmod +x ./import_kernel_sources.sh
+          ./import_kernel_sources.sh "${{ secrets.HMD_ARCHIVE_TOKEN }}" "${{ github.event.inputs.device_name }}"
+
+  # Job 2B: (SCHEDULE OR FULL MANUAL RUN) Build all devices in parallel
+  build-for-schedule:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.device_name == '')
+    needs: [get-devices]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device_name: ${{ fromJson(needs.get-devices.outputs.devices) }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Run for device - ${{ matrix.device_name }}
+        run: |
+          chmod +x ./import_kernel_sources.sh
+          ./import_kernel_sources.sh "${{ secrets.HMD_ARCHIVE_TOKEN }}" "${{ matrix.device_name }}"
+      - name: Report failure as a GitHub Issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // (Your issue reporting script here)
+
+  # Job 3: (SCHEDULE OR FULL MANUAL RUN) Update the dashboard
+  update-dashboard:
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.device_name == ''))
+    needs: [build-for-schedule]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Update Organization Profile README
+        run: |
+          chmod +x ./update_dashboard.sh
+          ./update_dashboard.sh "${{ secrets.HMD_ARCHIVE_TOKEN }}"
