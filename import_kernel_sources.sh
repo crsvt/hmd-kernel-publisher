@@ -30,7 +30,14 @@ JSON_URL="https://raw.githubusercontent.com/${JSON_REPO}/${JSON_BRANCH}/data/hmd
 JSON_DATA=$(curl -sL --fail "$JSON_URL") || { echo "Error: Failed to fetch JSON data from $JSON_URL" >&2; exit 1; }
 if ! echo "$JSON_DATA" | jq -e --arg device "$DEVICE_HUMAN" '.[$device]' > /dev/null; then echo "Error: Device '$DEVICE_HUMAN' not found..." >&2; exit 1; fi
 
-DEVICE_SLUG=$(echo "$DEVICE_HUMAN" | tr '[:upper:]' '[:lower:]' | sed -E 's/[ ()-]+/_/g')
+DEVICE_SLUG=$(echo "$DEVICE_HUMAN" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g' | sed 's/_$//')
+DEVICE_BRANCH=$(echo "$DEVICE_HUMAN" | sed -E 's/[()]+//g' | sed 's/ /_/g')
+
+DEVICE_SLUG=$(echo "$DEVICE_HUMAN" | tr '[:upper:]' '[:lower:]' | \
+  sed 's/+/ plus/g' | \
+  sed -E 's/[ ()-]+/_/g' | \
+  sed 's/__+/_/g'
+)
 DEVICE_BRANCH=$(echo "$DEVICE_HUMAN" | sed -E 's/[()]+//g' | sed 's/ /_/' | sed 's/ /-/g')
 
 GITHUB_REPO_NAME="android_kernel_${DEVICE_SLUG}"
@@ -56,6 +63,14 @@ git fetch --tags origin || true
 echo "-> Syncing with remote to prevent push errors..."
 git pull --rebase origin "$BRANCH_NAME" || true
 
+# Check if this is a brand new repo by checking for remote tags
+IS_NEW_REPO="false"
+if [ -z "$(git ls-remote --tags origin)" ]; then
+    echo "-> Detected a new repository with no existing tags."
+    IS_NEW_REPO="true"
+fi
+HAS_SUCCESSFUL_IMPORT="false"
+
 echo "$JSON_DATA" | jq -r --arg device "$DEVICE_HUMAN" '.[$device][] | "\(.name) \(.link)"' | while read -r ARCHIVE_NAME URL; do
     TAG="${ARCHIVE_NAME%.tar.*}"; LOCAL="${CACHE_DIR}/${ARCHIVE_NAME}";
     if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 || git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
@@ -80,9 +95,10 @@ echo "$JSON_DATA" | jq -r --arg device "$DEVICE_HUMAN" '.[$device][] | "\(.name)
             export GIT_AUTHOR_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE";
             git commit --allow-empty -m "${DEVICE_HUMAN}: Skipping ${TAG} (download failed)" \
                 -m "Source: ${URL}"
-            git tag -a "$TAG" -m "${DEVICE_HUMAN} ${TAG} kernel source drop (MISSING)"
+            FAILURE_TAG="${TAG}-MISSING"
+            git tag -a "$FAILURE_TAG" -m "${DEVICE_HUMAN} ${TAG} kernel source drop (MISSING)"
             git push -u origin "$BRANCH_NAME"
-            git push origin "$TAG"
+            git push origin "$FAILURE_TAG"
             continue
         fi
     else
@@ -114,14 +130,30 @@ echo "$JSON_DATA" | jq -r --arg device "$DEVICE_HUMAN" '.[$device][] | "\(.name)
             -m "Source: ${URL}" \
             -m "Archive: ${ARCHIVE_NAME}" \
             -m "SHA256: ${SUM}"
-        git tag -a "$TAG" -m "${DEVICE_HUMAN} ${TAG} kernel source drop (CORRUPTED)"
+        FAILURE_TAG="${TAG}-CORRUPTED"
+        git tag -a "$FAILURE_TAG" -m "${DEVICE_HUMAN} ${TAG} kernel source drop (CORRUPTED)"
         git push -u origin "$BRANCH_NAME"
-        git push origin "$TAG"
+        git push origin "$FAILURE_TAG"
         continue
     fi
 
     KDIR=""; while IFS= read -r -d '' d; do if [ -f "$d/Makefile" ] && [ -d "$d/arch" ] && [ -d "$d/drivers" ]; then KDIR="$d"; break; fi; done < <(find "$TMPDIR" -type d -print0);
-    if [ -z "$KDIR" ]; then echo "ERROR: No valid kernel root found in $ARCHIVE_NAME" >&2; exit 1; fi;
+    
+    if [ -z "$KDIR" ]; then
+        echo "!! ERROR: No valid kernel root found in '$ARCHIVE_NAME'. Tagging release as corrupted."
+        export GIT_AUTHOR_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE";
+        git commit --allow-empty -m "${DEVICE_HUMAN}: Skipping ${TAG} (invalid content)" \
+            -m "Source: ${URL}" \
+            -m "Archive: ${ARCHIVE_NAME}" \
+            -m "SHA256: ${SUM}" \
+            -m "Error: Archive extracted successfully but contained no kernel root directory."
+        FAILURE_TAG="${TAG}-CORRUPTED"
+        git tag -a "$FAILURE_TAG" -m "${DEVICE_HUMAN} ${TAG} kernel source drop (CORRUPTED)"
+        git push -u origin "$BRANCH_NAME"
+        git push origin "$FAILURE_TAG"
+        continue
+    fi
+
     KFOLDER="$(basename "$KDIR")"; echo "-> Using detected kernel root: $KFOLDER"; clean_repo_root; rsync -a --exclude='.git' "$KDIR"/ "$PWD"/;
     VERSION_PART=$(echo "$TAG" | sed -e "s/^${DEVICE_SLUG}_//i" -e "s/^nokia[0-9]*[a-z]*_//i");
     export GIT_AUTHOR_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE";
@@ -148,8 +180,17 @@ echo "$JSON_DATA" | jq -r --arg device "$DEVICE_HUMAN" '.[$device][] | "\(.name)
     echo "-> Pushing changes for $TAG to GitHub...";
     git push -u origin "$BRANCH_NAME"
     git push origin "$TAG"
-
+    
+    HAS_SUCCESSFUL_IMPORT="true"
     echo "==> Committed, tagged, and pushed $TAG"; echo
 done;
+
+if [ "$IS_NEW_REPO" = "true" ] && [ "$HAS_SUCCESSFUL_IMPORT" = "false" ]; then
+   echo "-> All archives processed for new device, but none were valid."
+   echo "-> Deleting empty repository $GITHUB_REPO_URL to prevent pollution."
+   cd ..
+   gh repo delete "$GITHUB_REPO_URL" --yes
+   echo "-> Repository deleted."
+fi
 
 echo "=============================="; echo "All tasks complete."; echo "View your repository at: $REMOTE_URL"; echo "=============================="
